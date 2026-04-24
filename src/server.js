@@ -6,6 +6,7 @@ import pool from './config/db.js';
 // Import Routes
 import employeeRoutes from './routes/employeeRoutes.js';
 import siteRoutes from './routes/siteRoutes.js';
+import attendanceRoutes from './routes/attendanceRoutes.js';
 
 dotenv.config();
 
@@ -19,6 +20,7 @@ app.use(express.json());
 // Register Routes
 app.use('/api/employees', employeeRoutes);
 app.use('/api/sites', siteRoutes);
+app.use('/api/attendance', attendanceRoutes);
 
 // Health Check Route
 app.get('/health', (req, res) => {
