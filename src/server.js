@@ -46,9 +46,31 @@ const io     = new Server(server, {
 });
 
 // ── Middleware ────────────────────────────────────────────────────────────────
+
+const allowedOrigins = [
+  'http://localhost:5173',
+  'https://attendance-admin-tan.vercel.app', // Add your final Vercel domain
+  'https://attendance-admin-j0e0s816l-amaldev-mahadevans-projects.vercel.app'
+];
+
 app.use(cors({
-  origin: ['https://attendance-admin-tan.vercel.app', 'http://localhost:3000']
+  origin: function (origin, callback) {
+    // 1. MOBILE APPS & SERVER-TO-SERVER:
+    // Mobile apps usually have an undefined origin. 
+    // This line allows them to bypass the check.
+    if (!origin) return callback(null, true);
+
+    // 2. WEB BROWSERS:
+    // Check if the website URL is in our trusted list.
+    if (allowedOrigins.includes(origin)) {
+      callback(null, true);
+    } else {
+      callback(new Error('Not allowed by CORS'));
+    }
+  },
+  credentials: true
 }));
+
 app.use(express.json({ limit: '50mb' }));
 app.use(express.urlencoded({ limit: '50mb', extended: true }));
 app.use('/uploads', express.static('uploads'));
