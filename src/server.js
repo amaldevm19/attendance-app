@@ -46,7 +46,9 @@ const io     = new Server(server, {
 });
 
 // ── Middleware ────────────────────────────────────────────────────────────────
-app.use(cors());
+app.use(cors({
+  origin: ['https://attendance-admin-tan.vercel.app', 'http://localhost:3000']
+}));
 app.use(express.json({ limit: '50mb' }));
 app.use(express.urlencoded({ limit: '50mb', extended: true }));
 app.use('/uploads', express.static('uploads'));
