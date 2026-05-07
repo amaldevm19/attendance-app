@@ -64,14 +64,16 @@ const consoleFormat = winston.format.combine(
   })
 );
 
-const winstonLogger = winston.createLogger({
+const winstonLogger = winston.createLogger({  
   level: _config.level,
   format: jsonFormat,
   transports: [
     // Console — always on, colored for dev
     new winston.transports.Console({ format: consoleFormat }),
 
+
     // Daily rotating file — 14 day retention, 20MB max per file
+    /* REMOVE OR COMMENT OUT THE FILE LOGGERS FOR RENDER
     new DailyRotateFile({
       dirname:     LOG_DIR,
       filename:    'btd-api-%DATE%.log',
@@ -91,6 +93,7 @@ const winstonLogger = winston.createLogger({
       level:       'error',
       zippedArchive: true,
     }),
+    */
   ],
 });
 
