@@ -496,19 +496,13 @@ router.post('/unassign-device', async (req, res) => {
 // POST: Verify Face for Attendance
 router.post('/verify-face', async (req, res) => {
 
-
-
   try {
     const sizeInBytes = req.get('content-length') || 0;
     console.log(`Payload size: ${sizeInBytes} bytes (${(sizeInBytes / 1024).toFixed(2)} KB)`);
-    let image, deviceId;
-    try {
-      image = req.body.image;
-      deviceId = req.body.deviceId;
-    } catch (error) {
-      console.error("Error parsing request body:", error);
-      return res.status(400).json({ error: 'Invalid request body' });
-    }
+
+    let image = req.body.image;
+    let deviceId = req.body.deviceId
+    
     
     const startTime = Date.now();
 
@@ -546,7 +540,9 @@ router.post('/verify-face', async (req, res) => {
         const storedDesc = new Float32Array(descriptorArray);
         const distance   = faceapi.euclideanDistance(liveDesc, storedDesc);
         if (distance < bestMatch.distance) bestMatch = { emp_id: emp.emp_id, name: emp.name, distance };
-      } catch {}
+      } catch (error) {
+        console.log(error)
+      }
     });
 
     const duration_ms = Date.now() - startTime;
@@ -567,6 +563,7 @@ router.post('/verify-face', async (req, res) => {
       res.status(401).json({ error: 'Face not recognized' });
     }
   } catch (err) {
+    console.log(err)
     logger.error(`Face verification error: ${err.message}`, {
       category: 'attendance', device_id: deviceId,
       duration_ms: Date.now() - startTime,
