@@ -14,7 +14,7 @@ if(process.env.NODE_ENV === 'development' ) {
     password: process.env.DB_PASSWORD,
     port: process.env.DB_PORT,
   });
-}else if(process.env.NODE_ENV === 'development' ) {
+}else if(process.env.NODE_ENV === 'production' ) {
   pool = new Pool({
     connectionString: process.env.DB_URL,
     ssl: {
