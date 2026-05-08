@@ -514,12 +514,12 @@ router.post('/verify-face', async (req, res) => {
     const base64Data = image.replace(/^data:image\/\w+;base64,/, '');
     const buffer     = Buffer.from(base64Data, 'base64');
     const img        = await loadImage(buffer);
-    let liveDetection;
-    try {
-        liveDetection = await faceapi.detectSingleFace(img).withFaceLandmarks().withFaceDescriptor();
-    } catch (error) {
-      console.log("Face detection error:", error);
-    }
+    const liveDetection = await faceapi.detectSingleFace(img).withFaceLandmarks().withFaceDescriptor();
+    // try {
+    //     liveDetection 
+    // } catch (error) {
+    //   console.log("Face detection error:", error);
+    // }
 
     if (!liveDetection) {
       logger.warn('Face verification — no face detected', {
