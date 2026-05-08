@@ -497,25 +497,14 @@ router.post('/unassign-device', async (req, res) => {
 router.post('/verify-face', async (req, res) => {
 
 
-try {
-
-  console.log("Headers:", req.headers);
-  console.log("Content-Type:", req.headers['content-type']);
-  console.log("Body:", req.body.deviceId);
-    // 1. Log Payload Size
-  const sizeInBytes = req.get('content-length') || 0;
-  console.log(`Payload size: ${sizeInBytes} bytes (${(sizeInBytes / 1024).toFixed(2)} KB)`);
-  
-  const { image, deviceId } = req.body;
-  const startTime = Date.now();
-  
-} catch (error) {
-  console.error("Error in /verify-face route:", error);
-  res.status(500).json({ error: 'Internal Server Error' });
-}
-
 
   try {
+    const sizeInBytes = req.get('content-length') || 0;
+    console.log(`Payload size: ${sizeInBytes} bytes (${(sizeInBytes / 1024).toFixed(2)} KB)`);
+  
+    const { image, deviceId } = req.body;
+    const startTime = Date.now();
+    
     const base64Data = image.replace(/^data:image\/\w+;base64,/, '');
     const buffer     = Buffer.from(base64Data, 'base64');
     const img        = await loadImage(buffer);
