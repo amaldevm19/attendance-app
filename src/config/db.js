@@ -4,7 +4,7 @@ import dotenv from 'dotenv';
 
 dotenv.config();
 
-const pool = null;
+let pool = null;
 
 if(process.env.NODE_ENV === 'development' ) {
   pool = new Pool({
