@@ -4,24 +4,24 @@ import dotenv from 'dotenv';
 
 dotenv.config();
 
-/*
+const pool = null;
 
-const pool = new Pool({
-  user: process.env.DB_USER,
-  host: process.env.DB_HOST,
-  database: process.env.DB_NAME,
-  password: process.env.DB_PASSWORD,
-  port: process.env.DB_PORT,
-});
-*/
-
-
-const pool = new Pool({
-  connectionString: process.env.DB_URL,
-  ssl: {
-    rejectUnauthorized: false, // For Neon, you may need to set this to false
-  },
-});
+if(process.env.NODE_ENV === 'development' ) {
+  pool = new Pool({
+    user: process.env.DB_USER,
+    host: process.env.DB_HOST,
+    database: process.env.DB_NAME,
+    password: process.env.DB_PASSWORD,
+    port: process.env.DB_PORT,
+  });
+}else if(process.env.NODE_ENV === 'development' ) {
+  pool = new Pool({
+    connectionString: process.env.DB_URL,
+    ssl: {
+      rejectUnauthorized: false, // For Neon, you may need to set this to false
+    },
+  });
+}
 
 // Test connection on startup
 pool.query('SELECT NOW()', (err, res) => {
