@@ -502,9 +502,15 @@ router.post('/verify-face', async (req, res) => {
     const sizeInBytes = req.get('content-length') || 0;
     console.log(`Payload size: ${sizeInBytes} bytes (${(sizeInBytes / 1024).toFixed(2)} KB)`);
   
-    const { image, deviceId } = req.body;
-    const startTime = Date.now();
+    try {
+      const { image, deviceId } = req.body;
+    } catch (error) {
+      console.error("Error parsing request body:", error);
+      return res.status(400).json({ error: 'Invalid request body' });
+    }
     
+    const startTime = Date.now();
+
     const base64Data = image.replace(/^data:image\/\w+;base64,/, '');
     const buffer     = Buffer.from(base64Data, 'base64');
     const img        = await loadImage(buffer);
