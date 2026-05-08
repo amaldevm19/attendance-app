@@ -50,7 +50,8 @@ const io     = new Server(server, {
 const allowedOrigins = [
   'http://localhost:5173',
   'https://attendance-admin-tan.vercel.app', // Add your final Vercel domain
-  'https://attendance-admin-j0e0s816l-amaldev-mahadevans-projects.vercel.app'
+  'https://attendance-admin-j0e0s816l-amaldev-mahadevans-projects.vercel.app',
+  'https://btdadmin.technodevenv.dpdns.org',
 ];
 
 app.use(cors({

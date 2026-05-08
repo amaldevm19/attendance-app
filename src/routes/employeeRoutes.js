@@ -496,12 +496,20 @@ router.post('/unassign-device', async (req, res) => {
 // POST: Verify Face for Attendance
 router.post('/verify-face', async (req, res) => {
 
-  // 1. Log Payload Size
+
+try {
+    // 1. Log Payload Size
   const sizeInBytes = req.get('content-length') || 0;
   console.log(`Payload size: ${sizeInBytes} bytes (${(sizeInBytes / 1024).toFixed(2)} KB)`);
   
   const { image, deviceId } = req.body;
   const startTime = Date.now();
+  
+} catch (error) {
+  console.error("Error in /verify-face route:", error);
+  res.status(500).json({ error: 'Internal Server Error' });
+}
+
 
   try {
     const base64Data = image.replace(/^data:image\/\w+;base64,/, '');
