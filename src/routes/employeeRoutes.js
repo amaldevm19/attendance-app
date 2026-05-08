@@ -7,9 +7,14 @@ import { Canvas, Image, ImageData, loadImage } from 'canvas';
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
+import util from 'util';
 // Replicate __dirname in ES Modules
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
+
+if (!util.isNullOrUndefined) {
+    util.isNullOrUndefined = (val) => val === null || val === undefined;
+}
 
 const router = express.Router();
 
