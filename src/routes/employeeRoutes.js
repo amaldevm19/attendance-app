@@ -498,6 +498,10 @@ router.post('/verify-face', async (req, res) => {
 
 
 try {
+
+  console.log("Headers:", req.headers);
+  console.log("Content-Type:", req.headers['content-type']);
+  console.log("Body:", req.body);
     // 1. Log Payload Size
   const sizeInBytes = req.get('content-length') || 0;
   console.log(`Payload size: ${sizeInBytes} bytes (${(sizeInBytes / 1024).toFixed(2)} KB)`);
