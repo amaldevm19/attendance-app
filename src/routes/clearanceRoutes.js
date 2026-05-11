@@ -122,10 +122,10 @@ router.post('/clear/:tableKey', async (req, res) => {
   try {
     await client.query('BEGIN');
 
-    // Single TRUNCATE with all tables at once — PostgreSQL handles FK resolution
-    // when all related tables are listed together in one statement
+    // Single TRUNCATE with CASCADE — PostgreSQL automatically handles any
+    // remaining FK dependents not explicitly listed
     const tableList = def.truncate.join(', ');
-    await client.query(`TRUNCATE TABLE ${tableList} RESTART IDENTITY`);
+    await client.query(`TRUNCATE TABLE ${tableList} RESTART IDENTITY CASCADE`);
 
     // RESTART IDENTITY in the TRUNCATE already resets sequences — no extra step needed
 
@@ -166,20 +166,13 @@ router.post('/clear-all', async (req, res) => {
   try {
     await client.query('BEGIN');
 
-    // Use the exact FK-derived safe order
-    const allTables = [
-      'attendance_logs', 'employee_devices', 'employee_portfolios',
-      'job_portfolios', 'job_products', 'job_systems', 'pending_enrollments',
-      'pending_site_enrollments', 'site_assets', 'site_jobs',
-      'jobs', 'products', 'sites', 'client_representatives',
-      'employees', 'job_categories', 'locations', 'systems',
-      'clients', 'designations', 'devices', 'portfolios', 'client_categories',
-      'logs',
-    ];
+    // Use the FK-derived SAFE_ORDER constant (leaves → roots), plus logs at the end
+    const allTables = [...SAFE_ORDER, 'logs'];
 
-    // Single TRUNCATE + RESTART IDENTITY resets all sequences automatically
+    // Single TRUNCATE + RESTART IDENTITY CASCADE resets all sequences automatically
+    // and handles any residual FK dependencies via CASCADE
     const tableList = allTables.join(', ');
-    await client.query(`TRUNCATE TABLE ${tableList} RESTART IDENTITY`);
+    await client.query(`TRUNCATE TABLE ${tableList} RESTART IDENTITY CASCADE`);
 
     await client.query('COMMIT');
 

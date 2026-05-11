@@ -48,10 +48,11 @@ const io     = new Server(server, {
 // ── Middleware ────────────────────────────────────────────────────────────────
 
 const allowedOrigins = [
-  'http://localhost:5173',
+  'https://btdapp.technodevenv.dpdns.org',
+  'https://btdadmin.technodevenv.dpdns.org',
   'https://attendance-admin-tan.vercel.app', // Add your final Vercel domain
   'https://attendance-admin-j0e0s816l-amaldev-mahadevans-projects.vercel.app',
-  'https://btdadmin.technodevenv.dpdns.org',
+  
 ];
 
 app.use(cors({
@@ -76,6 +77,8 @@ app.use(express.json({ limit: '50mb' }));
 app.use(express.urlencoded({ limit: '50mb', extended: true }));
 app.use('/uploads', express.static('uploads'));
 app.use(httpLogger); // Auto-log all HTTP requests
+
+
 
 // ── Routes ────────────────────────────────────────────────────────────────────
 app.use('/api/employees',    employeeRoutes);

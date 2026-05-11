@@ -8,6 +8,9 @@ import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import util from 'util';
+import dotenv from 'dotenv';
+
+dotenv.config();
 // Replicate __dirname in ES Modules
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -206,129 +209,6 @@ router.post('/:empId/enroll', async (req, res) => {
   }
 });
 
-/*
-router.post('/:empId/enroll', async (req, res) => {
-  const { empId } = req.params;
-  const { image } = req.body;
-  const startTime = Date.now();
-
-  // 1. Log Payload Size
-  const sizeInBytes = req.get('content-length') || 0;
-  console.log(`Payload size: ${sizeInBytes} bytes (${(sizeInBytes / 1024).toFixed(2)} KB)`);
-
-  try {
-   // Go up two levels from src/routes to the project root
-    const rootDir = path.join(__dirname, '..', '..'); 
-    const uploadDir = path.join(rootDir, 'uploads', 'profiles');
-
-    // Create the folder if it doesn't exist
-    if (!fs.existsSync(uploadDir)) {
-        fs.mkdirSync(uploadDir, { recursive: true });
-    }
-
-    const fileName = `${empId}_master.jpg`;
-    const filePath = path.join(uploadDir, fileName);
-
-    // 3. Clean Base64 and write
-    const base64Data = image.replace(/^data:image\/\w+;base64,/, '');
-    const buffer = Buffer.from(base64Data, 'base64');
-    fs.writeFileSync(filePath, buffer);
-
-    // 4. AI Detection
-    const img = await loadImage(buffer); // Better to load from buffer than disk
-    const result = await faceapi.detectSingleFace(img)
-      .withFaceLandmarks()
-      .withFaceDescriptor();
-
-    if (!result) {
-      // Cleanup: Optionally delete the failed image if you don't want junk
-      if (fs.existsSync(filePath)) fs.unlinkSync(filePath);
-      
-      return res.status(400).json({ error: 'No face detected. Try a clearer photo.' });
-    }
-
-    // 5. Database Update
-    const descriptor = Array.from(result.descriptor);
-    await pool.query(
-      "UPDATE employees SET enrollment_status = 'completed', profile_image = $1, face_descriptor = $2 WHERE emp_id = $3",
-      [`/uploads/profiles/${fileName}`, JSON.stringify(descriptor), empId]
-    );
-
-    // Clear pending tasks
-    await pool.query('DELETE FROM pending_enrollments WHERE employee_id = $1', [empId]);
-
-    // 6. Success Logging
-    const duration = Date.now() - startTime;
-    logger.info(`Face enrollment successful: ${empId} (${duration}ms)`);
-
-    io.emit('dashboard-update');
-    res.json({ success: true, message: 'Enrolled successfully!' });
-
-  } catch (err) {
-    console.error("Enrollment Error:", err);
-    res.status(500).json({ error: 'AI Processing Failed' });
-  }
-});
-*/
-
-/*
-router.post('/:empId/enroll', async (req, res) => {
-
-  const sizeInBytes = req.get('content-length');
-  const sizeInMB = (sizeInBytes / (1024 * 1024)).toFixed(2);
-  console.log(`Payload size: ${sizeInBytes} bytes (${sizeInMB} MB)`);
-
-  const { empId } = req.params;
-  const { image } = req.body;
-  const startTime = Date.now();
-  
-  try {
-
-
-    const fileName = `${empId}_master.jpg`;
-    const filePath = path.join('uploads/profiles', fileName);
-    const base64Data = image.replace(/^data:image\/\w+;base64,/, '');
-    fs.writeFileSync(filePath, base64Data, 'base64');
-
-    const img    = await loadImage(filePath);
-    const result = await faceapi.detectSingleFace(img).withFaceLandmarks().withFaceDescriptor();
-
-    if (!result) {
-      logger.warn(`Face enrollment failed — no face detected: ${empId}`, {
-        category: 'enrollment', user_id: empId,
-        meta: { duration_ms: Date.now() - startTime },
-      });
-      return res.status(400).json({ error: 'No face detected. Try a clearer photo.' });
-    }
-
-    const descriptor = Array.from(result.descriptor);
-    await pool.query(
-      "UPDATE employees SET enrollment_status = 'completed', profile_image = $1, face_descriptor = $2 WHERE emp_id = $3",
-      [`/uploads/profiles/${fileName}`, JSON.stringify(descriptor), empId]
-    );
-
-    // Clear pending enrollments for this employee — they're done
-    await pool.query('DELETE FROM pending_enrollments WHERE employee_id = $1', [empId]);
-
-    const duration_ms = Date.now() - startTime;
-    logger.info(`Face enrollment completed: ${empId}`, {
-      category: 'enrollment', user_id: empId,
-      duration_ms,
-      meta: { image_path: `/uploads/profiles/${fileName}`, detection_score: result.detection?.score },
-    });
-
-    io.emit('dashboard-update');
-    res.json({ success: true, message: 'Enrolled with AI signature!' });
-  } catch (err) {
-    logger.error(`Face enrollment error for ${empId}: ${err.message}`, {
-      category: 'enrollment', user_id: empId,
-      duration_ms: Date.now() - startTime,
-      meta: { error: err.message, stack: err.stack },
-    });
-    res.status(500).json({ error: 'AI Processing Failed' });
-  }
-});
-*/
 
 
 // DELETE Employee
@@ -502,24 +382,18 @@ router.post('/unassign-device', async (req, res) => {
 router.post('/verify-face', async (req, res) => {
 
   try {
-    const sizeInBytes = req.get('content-length') || 0;
-    console.log(`Payload size: ${sizeInBytes} bytes (${(sizeInBytes / 1024).toFixed(2)} KB)`);
+    if(process.env.NODE_ENV === 'development' ) {
+      const sizeInBytes = req.get('content-length') || 0;
+      console.log(`Payload size: ${sizeInBytes} bytes (${(sizeInBytes / 1024).toFixed(2)} KB)`);
+    }
 
-    let image = req.body.image;
-    let deviceId = req.body.deviceId
-    
-    
+    const{ image, deviceId } = req.body;
     const startTime = Date.now();
 
     const base64Data = image.replace(/^data:image\/\w+;base64,/, '');
     const buffer     = Buffer.from(base64Data, 'base64');
     const img        = await loadImage(buffer);
     const liveDetection = await faceapi.detectSingleFace(img).withFaceLandmarks().withFaceDescriptor();
-    // try {
-    //     liveDetection 
-    // } catch (error) {
-    //   console.log("Face detection error:", error);
-    // }
 
     if (!liveDetection) {
       logger.warn('Face verification — no face detected', {

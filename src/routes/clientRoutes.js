@@ -74,17 +74,20 @@ router.get('/:id', async (req, res) => {
 
 // POST create client
 router.post('/', async (req, res) => {
-  const { name, client_category_id } = req.body;
+  const { name, client_category_id, client_category } = req.body;
   if (!name?.trim()) return res.status(400).json({ error: 'Client name required.' });
+  if (client_category && !['direct_client', 'indirect_client'].includes(client_category)) {
+    return res.status(400).json({ error: 'client_category must be direct_client or indirect_client.' });
+  }
   try {
     const result = await pool.query(
-      'INSERT INTO clients (name, client_category_id) VALUES ($1, $2) RETURNING *',
-      [name.trim(), client_category_id || null]
+      'INSERT INTO clients (name, client_category_id, client_category) VALUES ($1, $2, $3) RETURNING *',
+      [name.trim(), client_category_id || null, client_category || null]
     );
     io.emit('dashboard-update');
     logger.info(`Client created: ${name}`, {
       category: 'general',
-      meta: { client_id: result.rows[0].id, name, client_category_id },
+      meta: { client_id: result.rows[0].id, name, client_category_id, client_category },
     });
     res.status(201).json(result.rows[0]);
   } catch (err) {
@@ -96,14 +99,21 @@ router.post('/', async (req, res) => {
 // PATCH update client
 router.patch('/:id', async (req, res) => {
   const { id } = req.params;
-  const { name, client_category_id } = req.body;
+  const { name, client_category_id, client_category } = req.body;
+  if (client_category && !['direct_client', 'indirect_client'].includes(client_category)) {
+    return res.status(400).json({ error: 'client_category must be direct_client or indirect_client.' });
+  }
   try {
     await pool.query(
-      'UPDATE clients SET name = COALESCE($1, name), client_category_id = COALESCE($2, client_category_id) WHERE id = $3',
-      [name, client_category_id, id]
+      `UPDATE clients SET
+        name = COALESCE($1, name),
+        client_category_id = COALESCE($2, client_category_id),
+        client_category = CASE WHEN $3::VARCHAR IS NOT NULL THEN $3::VARCHAR ELSE client_category END
+      WHERE id = $4`,
+      [name, client_category_id, client_category ?? null, id]
     );
     io.emit('dashboard-update');
-    logger.info(`Client updated: id ${id}`, { category: 'general', meta: { client_id: id, name, client_category_id } });
+    logger.info(`Client updated: id ${id}`, { category: 'general', meta: { client_id: id, name, client_category_id, client_category } });
     res.json({ success: true });
   } catch (err) {
     logger.error(`Client update failed for id ${id}: ${err.message}`, { category: 'database' });
@@ -194,5 +204,6 @@ router.delete('/reps/:repId', async (req, res) => {
     res.status(500).json({ error: err.message });
   }
 });
+
 
 export default router;
