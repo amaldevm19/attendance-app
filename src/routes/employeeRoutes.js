@@ -155,6 +155,92 @@ router.post('/', async (req, res) => {
   }
 });
 
+// POST: Bulk import employees from CSV
+router.post('/bulk-import', async (req, res) => {
+  const { rows } = req.body;
+  if (!Array.isArray(rows) || rows.length === 0)
+    return res.status(400).json({ error: 'No rows provided.' });
+
+  const results = [];
+
+  for (const row of rows) {
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+
+      const dup = await client.query('SELECT emp_id FROM employees WHERE emp_id = $1', [row.emp_id]);
+      if (dup.rows.length > 0) throw new Error('Employee ID already exists');
+
+      let designation_id = null, designation_name = row.designation?.trim() || null;
+      if (designation_name) {
+        const r = await client.query(
+          `SELECT id, name FROM designations WHERE LOWER(TRIM(name)) = LOWER(TRIM($1))`,
+          [designation_name]
+        );
+        if (r.rows[0]) { designation_id = r.rows[0].id; designation_name = r.rows[0].name; }
+        else designation_name = null;
+      }
+
+      const portfolio_ids = [];
+      for (const pName of (row.portfolios || [])) {
+        if (!pName?.trim()) continue;
+        const r = await client.query(
+          `SELECT id FROM portfolios WHERE LOWER(TRIM(name)) = LOWER(TRIM($1))`,
+          [pName.trim()]
+        );
+        if (r.rows[0]) portfolio_ids.push(r.rows[0].id);
+      }
+
+      let reports_to = row.reports_to?.trim() || null;
+      if (reports_to) {
+        const r = await client.query('SELECT emp_id FROM employees WHERE emp_id = $1', [reports_to]);
+        if (!r.rows[0]) reports_to = null;
+      }
+
+      let role_id = null;
+      if (designation_name) {
+        const r = await client.query(`SELECT id FROM roles WHERE LOWER(name) = LOWER($1) LIMIT 1`, [designation_name]);
+        role_id = r.rows[0]?.id || null;
+      }
+
+      await client.query(
+        `INSERT INTO employees (emp_id, name, designation, designation_id, phone, email, reports_to, role_id)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
+        [row.emp_id, row.name, designation_name, designation_id, row.phone || null, row.email || null, reports_to, role_id]
+      );
+
+      for (const pid of portfolio_ids) {
+        await client.query(
+          `INSERT INTO employee_portfolios (emp_id, portfolio_id) VALUES ($1,$2) ON CONFLICT DO NOTHING`,
+          [row.emp_id, pid]
+        );
+      }
+
+      await client.query('COMMIT');
+      results.push({ emp_id: row.emp_id, name: row.name, status: 'success' });
+
+      fetch(`http://localhost:${process.env.PORT || 3000}/api/assessment/seed-employee-components/${row.emp_id}`, { method: 'POST' })
+        .catch(() => {});
+
+    } catch (err) {
+      await client.query('ROLLBACK');
+      results.push({ emp_id: row.emp_id, name: row.name, status: 'error', error: err.message });
+    } finally {
+      client.release();
+    }
+  }
+
+  const successCount = results.filter(r => r.status === 'success').length;
+  if (successCount > 0) io.emit('dashboard-update');
+
+  logger.info(`Bulk import: ${successCount}/${rows.length} employees created`, {
+    category: 'auth',
+    meta: { total: rows.length, success: successCount, failed: rows.length - successCount },
+  });
+
+  res.json({ results });
+});
+
 // POST: Enroll Face (Master Photo)
 
 router.post('/:empId/enroll', async (req, res) => {
@@ -380,79 +466,83 @@ router.post('/unassign-device', async (req, res) => {
 
 // POST: Verify Face for Attendance
 router.post('/verify-face', async (req, res) => {
-
+  const startTime = Date.now();
   try {
-    if(process.env.NODE_ENV === 'development' ) {
+    if (process.env.NODE_ENV === 'development') {
       const sizeInBytes = req.get('content-length') || 0;
-      console.log(`Payload size: ${sizeInBytes} bytes (${(sizeInBytes / 1024).toFixed(2)} KB)`);
+      console.log(`verify-face payload: ${(sizeInBytes / 1024).toFixed(2)} KB`);
     }
 
-    const{ image, deviceId } = req.body;
-    const startTime = Date.now();
+    const { image, deviceId, empId } = req.body;
 
-    const base64Data = image.replace(/^data:image\/\w+;base64,/, '');
-    const buffer     = Buffer.from(base64Data, 'base64');
-    const img        = await loadImage(buffer);
-    const liveDetection = await faceapi.detectSingleFace(img).withFaceLandmarks().withFaceDescriptor();
+    if (!image) return res.status(400).json({ error: 'image required' });
+    if (!empId)  return res.status(400).json({ error: 'empId required' });
+
+    // 1. Detect face in submitted image
+    const base64Data    = image.replace(/^data:image\/\w+;base64,/, '');
+    const buffer        = Buffer.from(base64Data, 'base64');
+    const img           = await loadImage(buffer);
+    const liveDetection = await faceapi
+      .detectSingleFace(img)
+      .withFaceLandmarks()
+      .withFaceDescriptor();
 
     if (!liveDetection) {
-      logger.warn('Face verification — no face detected', {
-        category: 'attendance', device_id: deviceId,
+      logger.warn('verify-face — no face detected', {
+        category: 'face', device_id: deviceId, user_id: empId,
         duration_ms: Date.now() - startTime,
       });
-      return res.status(400).json({ error: 'No face detected' });
+      return res.status(400).json({ error: 'No face detected. Adjust position and try again.' });
     }
 
     const liveDesc = liveDetection.descriptor;
-    const result   = await pool.query(`
-      SELECT e.emp_id, e.name, e.face_descriptor 
+
+    // 2. Fetch ONLY the specified employee's descriptor
+    // This is O(1) — one employee, one comparison, fast and secure.
+    // Previously looped all device employees — allowed wrong person to be matched.
+    const empRes = await pool.query(`
+      SELECT e.emp_id, e.name, e.face_descriptor
       FROM employees e
-      JOIN employee_devices ed ON e.emp_id = ed.employee_id
-      JOIN devices d ON ed.device_id = d.id
-      WHERE d.device_unique_id = $1 AND e.enrollment_status = 'completed'
-    `, [deviceId]);
+      WHERE e.emp_id = $1
+        AND e.enrollment_status = 'completed'
+        AND e.face_descriptor IS NOT NULL
+    `, [empId]);
 
-    let bestMatch = { emp_id: null, name: 'Unknown', distance: 1.0 };
+    if (!empRes.rows.length) {
+      return res.status(404).json({ error: 'Employee not enrolled. Face data not found.' });
+    }
 
-    result.rows.forEach(emp => {
-      try {
-        if (!emp.face_descriptor) return;
-        const descriptorArray = typeof emp.face_descriptor === 'string'
-          ? JSON.parse(emp.face_descriptor)
-          : emp.face_descriptor;
-        const storedDesc = new Float32Array(descriptorArray);
-        const distance   = faceapi.euclideanDistance(liveDesc, storedDesc);
-        if (distance < bestMatch.distance) bestMatch = { emp_id: emp.emp_id, name: emp.name, distance };
-      } catch (error) {
-        console.log(error)
-      }
-    });
+    const emp = empRes.rows[0];
+
+    // 3. Compare live descriptor against this employee's stored descriptor only
+    const descriptorArray = typeof emp.face_descriptor === 'string'
+      ? JSON.parse(emp.face_descriptor)
+      : emp.face_descriptor;
+    const storedDesc = new Float32Array(descriptorArray);
+    const distance   = faceapi.euclideanDistance(liveDesc, storedDesc);
 
     const duration_ms = Date.now() - startTime;
 
-    if (bestMatch.distance < 0.55) {
-      logger.info(`Face verified: ${bestMatch.name} (${bestMatch.emp_id}) — distance ${bestMatch.distance.toFixed(3)}`, {
-        category: 'attendance', user_id: bestMatch.emp_id, device_id: deviceId,
-        duration_ms,
-        meta: { distance: bestMatch.distance, candidates: result.rows.length },
+    if (distance < 0.55) {
+      logger.info(`Face verified: ${emp.name} (${emp.emp_id}) dist=${distance.toFixed(3)}`, {
+        category: 'face', user_id: emp.emp_id, device_id: deviceId,
+        duration_ms, meta: { distance },
       });
-      res.json({ success: true, employee: bestMatch });
+      res.json({ success: true, employee: { emp_id: emp.emp_id, name: emp.name, distance } });
     } else {
-      logger.warn(`Face verification failed — best distance ${bestMatch.distance.toFixed(3)} (threshold 0.55)`, {
-        category: 'attendance', device_id: deviceId,
-        duration_ms,
-        meta: { best_distance: bestMatch.distance, candidates: result.rows.length },
+      logger.warn(`Face mismatch for ${emp.emp_id} — dist=${distance.toFixed(3)} (threshold 0.55)`, {
+        category: 'face', device_id: deviceId,
+        duration_ms, meta: { distance, emp_id: empId },
       });
-      res.status(401).json({ error: 'Face not recognized' });
+      res.status(401).json({ error: 'Face not recognized. Please try again.' });
     }
   } catch (err) {
-    console.log(err)
-    logger.error(`Face verification error: ${err.message}`, {
-      category: 'attendance', device_id: deviceId,
+    logger.error(`verify-face error: ${err.message}`, {
+      category: 'face',
       duration_ms: Date.now() - startTime,
-      meta: { error: err.message, stack: err.stack },
+      meta: { error: err.message },
     });
-    res.status(500).json({ error: 'AI Processing Error' });
+    res.status(500).json({ error: 'Face processing failed.' });
   }
 });
 

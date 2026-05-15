@@ -52,6 +52,49 @@ router.post('/', async (req, res) => {
   }
 });
 
+// POST: Bulk import locations from CSV
+router.post('/bulk-import', async (req, res) => {
+  const { rows } = req.body;
+  if (!Array.isArray(rows) || rows.length === 0)
+    return res.status(400).json({ error: 'No rows provided.' });
+
+  const results = [];
+
+  for (const row of rows) {
+    try {
+      if (!row.name?.trim()) throw new Error('Location name is required');
+
+      let emirate_id = null;
+      if (row.emirate?.trim()) {
+        const r = await pool.query(
+          `SELECT id FROM emirates WHERE LOWER(TRIM(name)) = LOWER(TRIM($1))`,
+          [row.emirate.trim()]
+        );
+        emirate_id = r.rows[0]?.id || null;
+      }
+
+      await pool.query(
+        'INSERT INTO locations (name, emirate_id) VALUES ($1, $2)',
+        [row.name.trim(), emirate_id]
+      );
+
+      results.push({ name: row.name, status: 'success' });
+    } catch (err) {
+      results.push({ name: row.name, status: 'error', error: err.message });
+    }
+  }
+
+  const successCount = results.filter(r => r.status === 'success').length;
+  if (successCount > 0) io.emit('dashboard-update');
+
+  logger.info(`Bulk location import: ${successCount}/${rows.length} created`, {
+    category: 'general',
+    meta: { total: rows.length, success: successCount, failed: rows.length - successCount },
+  });
+
+  res.json({ results });
+});
+
 // PATCH update location
 router.patch('/:id', async (req, res) => {
   const { id } = req.params;

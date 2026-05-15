@@ -121,6 +121,51 @@ router.post('/', async (req, res) => {
   }
 });
 
+// POST: Bulk import sites from CSV
+router.post('/bulk-import', async (req, res) => {
+  const { rows } = req.body;
+  if (!Array.isArray(rows) || rows.length === 0)
+    return res.status(400).json({ error: 'No rows provided.' });
+
+  const results = [];
+
+  for (const row of rows) {
+    try {
+      let location_id = null;
+      if (row.location?.trim()) {
+        const r = await pool.query(
+          `SELECT id FROM locations WHERE LOWER(TRIM(name)) = LOWER(TRIM($1))`,
+          [row.location.trim()]
+        );
+        location_id = r.rows[0]?.id || null;
+      }
+
+      const lat = parseFloat(row.latitude);
+      const lng = parseFloat(row.longitude);
+
+      await pool.query(
+        `INSERT INTO sites (site_name, latitude, longitude, location_id, enrollment_status, gps_enrolled_at)
+         VALUES ($1, $2, $3, $4, 'completed', NOW())`,
+        [row.site_name.trim(), lat, lng, location_id]
+      );
+
+      results.push({ site_name: row.site_name, status: 'success' });
+    } catch (err) {
+      results.push({ site_name: row.site_name, status: 'error', error: err.message });
+    }
+  }
+
+  const successCount = results.filter(r => r.status === 'success').length;
+  if (successCount > 0) io.emit('dashboard-update');
+
+  logger.info(`Bulk site import: ${successCount}/${rows.length} sites created`, {
+    category: 'general',
+    meta: { total: rows.length, success: successCount, failed: rows.length - successCount },
+  });
+
+  res.json({ results });
+});
+
 // PATCH update site
 router.patch('/:id', async (req, res) => {
   const { id } = req.params;
@@ -283,5 +328,6 @@ router.delete('/:id', async (req, res) => {
     res.status(500).json({ error: err.message });
   }
 });
+
 
 export default router;

@@ -459,6 +459,9 @@ router.get('/pending-assessment-tasks/:deviceId', async (req, res) => {
         s.session_type,
         s.deadline,
         s.status   AS session_status,
+        s.respondent_id,
+        r.name     AS respondent_name,
+        r.designation AS respondent_designation,
         e.emp_id,
         e.name     AS employee_name,
         e.designation,
@@ -471,6 +474,7 @@ router.get('/pending-assessment-tasks/:deviceId', async (req, res) => {
       JOIN assessment_sessions s ON pat.session_id = s.id
       JOIN devices d ON pat.device_id = d.id
       JOIN employees e ON s.employee_id = e.emp_id
+      LEFT JOIN employees r ON s.respondent_id = r.emp_id
       LEFT JOIN employees mgr ON (
         CASE
           WHEN s.session_type = 'rate_supervisor' THEN e.reports_to

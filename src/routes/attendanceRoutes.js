@@ -10,7 +10,7 @@ import pool from '../config/db.js';
 import { findNearestSite } from '../utils/geoUtils.js';
 import { io, connectedDevices } from '../server.js';
 import logger from '../logger.js';
-import { notifyTL, notifyEmployee, notifyPM } from '../utils/notificationService.js';
+import { notifyTL, notifyEmployee, notifyPM, notifyApprovers, insertApprovalReviewers } from '../utils/notificationService.js';
 
 const router = express.Router();
 
@@ -37,8 +37,25 @@ function haversineMetres(lat1, lon1, lat2, lon2) {
  * Falls back to a broadcast on the employee room if the device is not in
  * connectedDevices (e.g. the employee has two devices).
  */
-function emitToEmployee(empId, event, data) {
-  io.to(`emp-${empId}`).emit(event, data);
+// Emit to all devices assigned to an employee.
+// primaryOnly = true → only primary device (personal notifications like approval-result)
+// Mirrors the pattern used in assessmentRoutes.js
+async function emitToEmployee(empId, event, data, primaryOnly = false) {
+  try {
+    const devRes = await pool.query(`
+      SELECT d.device_unique_id
+      FROM employee_devices ed
+      JOIN devices d ON ed.device_id = d.id
+      WHERE ed.employee_id = $1
+        ${primaryOnly ? 'AND ed.is_primary = TRUE' : ''}
+    `, [empId]);
+    devRes.rows.forEach(row => {
+      const socketId = connectedDevices.get(row.device_unique_id);
+      if (socketId) io.to(socketId).emit(event, data);
+    });
+  } catch (err) {
+    logger.warn(`emitToEmployee failed for ${empId}: ${err.message}`, { category: 'socket' });
+  }
 }
 
 /**
@@ -50,6 +67,8 @@ function emitToEmployee(empId, event, data) {
  * falls back to any admin account in the system so approvals never go
  * into a black hole. Returns null only if no admin exists.
  */
+// getTLForEmployee kept for internal legacy use only.
+// New code uses notifyApprovers() from notificationService instead.
 async function getTLForEmployee(empId) {
   const res = await pool.query(
     'SELECT reports_to FROM employees WHERE emp_id = $1',
@@ -57,8 +76,6 @@ async function getTLForEmployee(empId) {
   );
   const tl = res.rows[0]?.reports_to;
   if (tl) return tl;
-
-  // Employee is TL or top of chain — route to admin account
   const adminRes = await pool.query(
     `SELECT e.emp_id FROM employees e
      JOIN roles r ON e.role_id = r.id
@@ -137,12 +154,30 @@ router.get('/check-status', async (req, res) => {
       WHERE e.reports_to = $1 AND ar.status = 'pending'
     `, [emp_id]);
 
+    // Check for open SPECIAL_IN with no matching SPECIAL_OUT
+    // Used by mobile to auto-determine if employee is checking IN or OUT
+    const specialRes = await pool.query(`
+      SELECT al.id, al.log_time, al.sub_type
+      FROM attendance_logs al
+      WHERE al.employee_id = $1
+        AND al.action_type = 'SPECIAL_IN'
+        AND NOT EXISTS (
+          SELECT 1 FROM attendance_logs al2
+          WHERE al2.employee_id = al.employee_id
+            AND al2.action_type = 'SPECIAL_OUT'
+            AND al2.log_time > al.log_time
+        )
+      ORDER BY al.log_time DESC
+      LIMIT 1
+    `, [emp_id]);
+
     res.json({
       open_duty_session:       dutySession,
       open_site_sessions:      siteSessions,
       has_stale_session:       hasStale,
       pending_correction:      corrRes.rows[0] || null,
       pending_approvals_count: parseInt(approvalRes.rows[0].count),
+      open_special_session:    specialRes.rows[0] || null,
     });
   } catch (err) {
     logger.error(`check-status failed for ${emp_id}: ${err.message}`, {
@@ -431,53 +466,74 @@ router.post('/special-punch', async (req, res) => {
     action, sub_type, job_id, reason,
   } = req.body;
 
-  if (!emp_id || !action || !sub_type || !reason) {
-    return res.status(400).json({
-      error: 'emp_id, action (in/out), sub_type, reason required.',
-    });
+  // SPECIAL OUT only needs emp_id + action — the open session already holds
+  // sub_type and reason from the original SPECIAL IN.
+  // SPECIAL IN needs emp_id + action + sub_type + reason.
+  const isOut = action === 'out';
+  if (!emp_id || !action) {
+    return res.status(400).json({ error: 'emp_id and action (in/out) required.' });
+  }
+  if (!isOut && (!sub_type || !reason)) {
+    return res.status(400).json({ error: 'sub_type and reason required for SPECIAL IN.' });
   }
 
-  const actionType = action === 'in' ? 'SPECIAL_IN' : 'SPECIAL_OUT';
+  const actionType  = action === 'in' ? 'SPECIAL_IN' : 'SPECIAL_OUT';
+  const isAutoApproved = action === 'out'; // Special OUT is auto-approved
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
 
     const punchTime = log_time ? new Date(log_time) : new Date();
 
-    // Insert unapproved log
+    // Insert log — SPECIAL_OUT is auto-approved, SPECIAL_IN requires TL approval
     const logRes = await client.query(`
       INSERT INTO attendance_logs
         (employee_id, action_type, log_time, latitude, longitude, site_id, job_id,
          sub_type, location_type, is_approved)
-      VALUES ($1, $2, $3, $4, $5, NULL, $6, $7, 'unauthorized', FALSE)
+      VALUES ($1, $2, $3, $4, $5, NULL, $6, $7, 'unauthorized', $8)
       RETURNING id
-    `, [emp_id, actionType, punchTime, latitude, longitude, job_id || null, sub_type]);
+    `, [emp_id, actionType, punchTime, latitude, longitude, job_id || null, sub_type, isAutoApproved]);
 
     const logId = logRes.rows[0].id;
 
-    // Create approval_request for TL
-    const approvalRes = await client.query(`
-      INSERT INTO approval_requests
-        (employee_id, attendance_log_id, request_type, sub_type, reason, punch_time, job_id)
-      VALUES ($1, $2, 'special_punch', $3, $4, $5, $6)
-      RETURNING id
-    `, [emp_id, logId, sub_type, reason, punchTime, job_id || null]);
+    // Create approval_request — only for SPECIAL_IN
+    // SPECIAL_OUT is auto-approved (it closes the IN session)
+    let approvalRes = { rows: [{ id: null }] };
+    if (!isAutoApproved) {
+      approvalRes = await client.query(`
+        INSERT INTO approval_requests
+          (employee_id, attendance_log_id, request_type, sub_type, reason, punch_time, job_id)
+        VALUES ($1, $2, 'special_punch', $3, $4, $5, $6)
+        RETURNING id
+      `, [emp_id, logId, sub_type, reason, punchTime, job_id || null]);
+
+      const approvalId = approvalRes.rows[0].id;
+
+      // Insert reviewer rows — wrapped in try/catch so migration_approval_reviewers.sql
+      // not being run yet doesn't kill the transaction. Falls back to legacy routing.
+      try {
+        const { getApproverChain: _chain, insertApprovalReviewers: _insert } =
+          await import('../utils/notificationService.js');
+        const approvers = await _chain(emp_id);
+        await _insert(client, approvalId, approvers);
+      } catch (reviewerErr) {
+        logger.warn(`approval_reviewers insert skipped (run migration?): ${reviewerErr.message}`, {
+          category: 'attendance',
+        });
+      }
+    }
 
     await client.query('COMMIT');
 
-    // Notify TL via socket + notification
-    const tlId = await getTLForEmployee(emp_id);
-    if (tlId) {
-      await notifyTLSocket(tlId, 'new-approval-task', {
-        type: 'special_punch',
-        approval_id: approvalRes.rows[0].id,
-        emp_id,
-        sub_type,
-        reason,
-      });
-      // Fire-and-forget notification (don't block response)
-      notifyTL(tlId, 'special_punch', { emp_id, sub_type, reason, punch_time: punchTime })
-        .catch(e => logger.warn(`TL notify failed: ${e.message}`, { category: 'notification' }));
+    // Notify all approvers in chain (socket + email + WhatsApp)
+    if (!isAutoApproved) {
+      notifyApprovers(
+        io, emp_id,
+        'new-approval-task',
+        { type: 'special_punch', approval_id: approvalRes.rows[0].id, emp_id, sub_type, reason },
+        'special_punch',
+        { emp_id, sub_type, reason, punch_time: punchTime }
+      ).catch(e => logger.warn(`notifyApprovers failed: ${e.message}`, { category: 'notification' }));
     }
 
     logger.info(`SPECIAL_PUNCH ${actionType}: ${emp_id} [${sub_type}]`, {
@@ -573,22 +629,27 @@ router.post('/correction-request', async (req, res) => {
       [open_session_id]
     );
 
+    // Insert reviewer rows — safe fallback if migration not run yet
+    try {
+      const corrApprovers = await import('../utils/notificationService.js')
+        .then(m => m.getApproverChain(emp_id));
+      await insertApprovalReviewers(client, approvalRes.rows[0].id, corrApprovers);
+    } catch (reviewerErr) {
+      logger.warn(`approval_reviewers insert skipped (run migration?): ${reviewerErr.message}`, {
+        category: 'attendance',
+      });
+    }
+
     await client.query('COMMIT');
 
-    // Notify TL
-    const tlId = await getTLForEmployee(emp_id);
-    if (tlId) {
-      await notifyTLSocket(tlId, 'new-correction-task', {
-        correction_id: corrId,
-        approval_id:   approvalRes.rows[0].id,
-        emp_id,
-        proposed_out_time,
-        reason,
-      });
-      notifyTL(tlId, 'correction', {
-        emp_id, proposed_out_time, reason, site_id: sess.site_id,
-      }).catch(e => logger.warn(`TL notify failed: ${e.message}`, { category: 'notification' }));
-    }
+    // Notify all approvers in chain (socket + email + WhatsApp) — fire-and-forget
+    notifyApprovers(
+      io, emp_id,
+      'new-correction-task',
+      { correction_id: corrId, approval_id: approvalRes.rows[0].id, emp_id, proposed_out_time, reason },
+      'correction',
+      { emp_id, proposed_out_time, reason, site_id: sess.site_id }
+    ).catch(e => logger.warn(`notifyApprovers failed: ${e.message}`, { category: 'notification' }));
 
     logger.info(`CORRECTION_REQUEST: ${emp_id} for session ${open_session_id}`, {
       category: 'attendance', user_id: emp_id,
@@ -669,19 +730,30 @@ router.get('/pending-approvals/:empId', async (req, res) => {
       LEFT JOIN sites si ON ar.site_id = si.id
       LEFT JOIN jobs j ON ar.job_id = j.id
       LEFT JOIN correction_requests cr ON ar.correction_request_id = cr.id
-      WHERE (
-        -- Standard: employee reports to this TL
-        e.reports_to = $1
-        OR
-        -- Admin fallback: items where the employee has no TL (they ARE the TL)
-        -- and this viewer is an admin role
-        (e.reports_to IS NULL AND e.emp_id != $1 AND EXISTS (
-          SELECT 1 FROM employees ea
-          JOIN roles ra ON ea.role_id = ra.id
-          WHERE ea.emp_id = $1 AND LOWER(ra.name) = 'admin'
-        ))
-      )
-        AND ar.status = 'pending'
+      WHERE ar.status = 'pending'
+        AND (
+          -- New: reviewer is explicitly listed in approval_reviewers chain
+          EXISTS (
+            SELECT 1 FROM approval_reviewers rv
+            WHERE rv.approval_request_id = ar.id
+              AND rv.reviewer_emp_id = $1
+          )
+          OR
+          -- Legacy fallback: approvals created before approval_reviewers existed
+          -- uses old reports_to direct relationship
+          (
+            NOT EXISTS (SELECT 1 FROM approval_reviewers rv WHERE rv.approval_request_id = ar.id)
+            AND (
+              e.reports_to = $1
+              OR
+              (e.reports_to IS NULL AND e.emp_id != $1 AND EXISTS (
+                SELECT 1 FROM employees ea
+                JOIN roles ra ON ea.role_id = ra.id
+                WHERE ea.emp_id = $1 AND LOWER(ra.name) = 'admin'
+              ))
+            )
+          )
+        )
       ORDER BY ar.created_at ASC
     `, [empId]);
 
@@ -743,12 +815,20 @@ router.post('/approve/:requestId', async (req, res) => {
     const scoreFlag = !approved;
     const now = new Date();
 
-    // Update approval_request
+    // Update approval_request (overall status — first approver to act closes it)
     await client.query(`
       UPDATE approval_requests
       SET status = $1, reviewed_by = $2, reviewed_at = $3, tl_comment = $4
       WHERE id = $5
     `, [newStatus, reviewer_emp_id, now, tl_comment || null, requestId]);
+
+    // Record individual reviewer's action in approval_reviewers (if row exists)
+    // This preserves who acted and when, even though the overall request is now closed.
+    await client.query(`
+      UPDATE approval_reviewers
+      SET action = $1, action_comment = $2, acted_at = $3
+      WHERE approval_request_id = $4 AND reviewer_emp_id = $5
+    `, [newStatus, tl_comment || null, now, requestId, reviewer_emp_id]);
 
     // ── CORRECTION type ───────────────────────────────────────────────────
     if (ar.request_type === 'correction' && ar.correction_request_id) {
@@ -824,13 +904,20 @@ router.post('/approve/:requestId', async (req, res) => {
       }
     }
 
-    // Notify employee socket
-    // approval-result is a personal notification → primary device only
+    // Notify employee socket — include context for notification store
+    const reviewerNameRes = await pool.query(
+      'SELECT name FROM employees WHERE emp_id = $1', [reviewer_emp_id]
+    );
+    const reviewer_name = reviewerNameRes.rows[0]?.name || reviewer_emp_id;
+
     emitToEmployee(ar.employee_id, 'approval-result', {
-      request_id: requestId,
+      request_id:    requestId,
       approved,
       tl_comment,
-    }, true);
+      request_type:  ar.request_type,
+      emp_id:        ar.employee_id,
+      reviewer_name,
+    });
     io.emit('dashboard-update');
 
     logger.info(
@@ -1162,6 +1249,271 @@ router.get('/logs', async (req, res) => {
     res.json(result.rows);
   } catch (err) {
     logger.error(`Fetch attendance logs failed: ${err.message}`, { category: 'database' });
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// GET /attendance/my-sessions/:empId
+// Mobile "My Attendance" page — paginated duty sessions with nested specials.
+//
+// Each "session" = one DUTY_START → DUTY_END pair.
+// Active duty (no DUTY_END yet) returned as session_status = 'active'.
+// Special punches (SPECIAL_IN / SPECIAL_OUT) within the duty window
+// are nested inside each session.
+//
+// Query params:
+//   from    — date string YYYY-MM-DD (inclusive, default 7 days ago)
+//   to      — date string YYYY-MM-DD (inclusive, default today)
+//   status  — '' | 'active' | 'complete' | 'pending'
+//   page    — integer (default 1)
+//   limit   — integer (default 10)
+// ─────────────────────────────────────────────────────────────────────────────
+router.get('/my-sessions/:empId', async (req, res) => {
+  const { empId } = req.params;
+  const {
+    from   = defaultFrom(),
+    to     = defaultTo(),
+    status = '',
+    page   = 1,
+    limit  = 10,
+  } = req.query;
+
+  // helpers scoped here so the endpoint is self-contained
+  function defaultFrom() {
+    const d = new Date();
+    d.setDate(d.getDate() - 7);
+    return d.toISOString().split('T')[0];
+  }
+  function defaultTo() {
+    return new Date().toISOString().split('T')[0];
+  }
+
+  const pageNum  = parseInt(page)  || 1;
+  const limitNum = parseInt(limit) || 10;
+  const offset   = (pageNum - 1) * limitNum;
+
+  try {
+    // ── 1. Fetch all DUTY_START logs in range ────────────────────────────────
+    // Each DUTY_START = beginning of one session row.
+    const startsRes = await pool.query(`
+      SELECT id, log_time AS start_time
+      FROM attendance_logs
+      WHERE employee_id = $1
+        AND action_type = 'DUTY_START'
+        AND log_time >= $2::date
+        AND log_time  < ($3::date + INTERVAL '1 day')
+      ORDER BY log_time DESC
+    `, [empId, from, to]);
+
+    const starts = startsRes.rows;
+    if (!starts.length) {
+      return res.json({ sessions: [], total: 0, page: pageNum, total_pages: 0 });
+    }
+
+    // ── 2. For each DUTY_START, find the next DUTY_END (if any) ─────────────
+    // Then find SPECIAL_IN / SPECIAL_OUT logs inside that window.
+    const allSessions = [];
+
+    for (const s of starts) {
+      // Nearest DUTY_END after this start
+      const endRes = await pool.query(`
+        SELECT id, log_time AS end_time
+        FROM attendance_logs
+        WHERE employee_id = $1
+          AND action_type = 'DUTY_END'
+          AND log_time > $2
+        ORDER BY log_time ASC
+        LIMIT 1
+      `, [empId, s.start_time]);
+
+      const endRow    = endRes.rows[0] || null;
+      const endTime   = endRow?.end_time || null;
+      const sessionStatus = endTime ? 'complete' : 'active';
+
+      // Duration in minutes (null if still active)
+      let durationMinutes = null;
+      if (endTime) {
+        durationMinutes =
+          (new Date(endTime) - new Date(s.start_time)) / 60000;
+      }
+
+      // Special punches within this duty window
+      const upperBound = endTime ? endTime : new Date().toISOString();
+      const specialsRes = await pool.query(`
+        SELECT
+          al.id,
+          al.action_type,
+          al.log_time   AS time,
+          al.sub_type,
+          ar.status     AS approval_status
+        FROM attendance_logs al
+        LEFT JOIN approval_requests ar
+          ON ar.attendance_log_id = al.id
+         AND ar.request_type = 'special_punch'
+        WHERE al.employee_id = $1
+          AND al.action_type IN ('SPECIAL_IN', 'SPECIAL_OUT')
+          AND al.log_time >= $2
+          AND al.log_time <= $3
+        ORDER BY al.log_time ASC
+      `, [empId, s.start_time, upperBound]);
+
+      // Map action_type to a shorter label for display
+      const specials = specialsRes.rows.map(sp => ({
+        id:              sp.id,
+        action:          sp.action_type,   // SPECIAL_IN | SPECIAL_OUT
+        time:            sp.time,
+        sub_type:        sp.sub_type,
+        approval_status: sp.approval_status || 'approved', // SPECIAL_OUT is auto-approved so no AR row
+      }));
+
+      // Derive session_status considering pending specials
+      const hasPendingSpecial = specials.some(sp => sp.approval_status === 'pending');
+      const effectiveStatus =
+        sessionStatus === 'active'       ? 'active'
+        : hasPendingSpecial              ? 'pending'
+        : 'complete';
+
+      allSessions.push({
+        id:               s.id,            // DUTY_START log id — unique per session
+        start_time:       s.start_time,
+        end_time:         endTime,
+        duration_minutes: durationMinutes ? Math.round(durationMinutes) : null,
+        session_status:   effectiveStatus,
+        special_punches:  specials,
+      });
+    }
+
+    // ── 3. Apply status filter ───────────────────────────────────────────────
+    const filtered = status
+      ? allSessions.filter(s => s.session_status === status)
+      : allSessions;
+
+    // ── 4. Paginate ──────────────────────────────────────────────────────────
+    const total       = filtered.length;
+    const totalPages  = Math.ceil(total / limitNum) || 1;
+    const paginated   = filtered.slice(offset, offset + limitNum);
+
+    res.json({
+      sessions:    paginated,
+      total,
+      page:        pageNum,
+      total_pages: totalPages,
+    });
+  } catch (err) {
+    logger.error(`my-sessions failed for ${empId}: ${err.message}`, {
+      category: 'attendance', user_id: empId,
+    });
+    res.status(500).json({ error: err.message });
+  }
+});
+
+
+// ─────────────────────────────────────────────────────────────────────────────
+// GET /attendance/all-approvals
+// Admin view — all approval requests across all employees with full context.
+// Supports optional filters: status, request_type, emp_id, from, to
+// ─────────────────────────────────────────────────────────────────────────────
+router.get('/all-approvals', async (req, res) => {
+  const { status, request_type, emp_id, from, to } = req.query;
+
+  const params  = [];
+  const clauses = [];
+
+  if (status)       { params.push(status);        clauses.push(`ar.status = $${params.length}`); }
+  if (request_type) { params.push(request_type);  clauses.push(`ar.request_type = $${params.length}`); }
+  if (emp_id)       { params.push(emp_id);        clauses.push(`ar.employee_id = $${params.length}`); }
+  if (from)         { params.push(from);           clauses.push(`ar.created_at >= $${params.length}::date`); }
+  if (to)           { params.push(to);             clauses.push(`ar.created_at < ($${params.length}::date + INTERVAL '1 day')`); }
+
+  const where = clauses.length ? 'WHERE ' + clauses.join(' AND ') : '';
+
+  try {
+    const result = await pool.query(`
+      SELECT
+        ar.id              AS approval_id,
+        ar.request_type,
+        ar.sub_type,
+        ar.reason,
+        ar.punch_time,
+        ar.status,
+        ar.created_at,
+        ar.reviewed_by,
+        ar.reviewed_at,
+        ar.tl_comment,
+        ar.site_id,
+        ar.job_id,
+        ar.correction_request_id,
+        ar.attendance_log_id,
+        e.name             AS employee_name,
+        e.emp_id,
+        si.site_name,
+        j.job_code, j.job_number,
+        cr.proposed_out_time,
+        cr.session_punched_in_at,
+        cr.sub_type        AS correction_sub_type
+      FROM approval_requests ar
+      JOIN employees e  ON ar.employee_id = e.emp_id
+      LEFT JOIN sites si  ON ar.site_id   = si.id
+      LEFT JOIN jobs j    ON ar.job_id    = j.id
+      LEFT JOIN correction_requests cr ON ar.correction_request_id = cr.id
+      ${where}
+      ORDER BY ar.created_at DESC
+    `, params);
+
+    res.json(result.rows);
+  } catch (err) {
+    logger.error(`all-approvals fetch failed: ${err.message}`, { category: 'attendance' });
+    res.status(500).json({ error: err.message });
+  }
+});
+
+
+// ─────────────────────────────────────────────────────────────────────────────
+// GET /attendance/open-sessions/:empId
+// Returns all open active_sessions for an employee that need correction.
+// Used by the Requests tile > Forgotten Punch flow.
+//
+// Includes BOTH:
+//   - session_type = 'site'  → missed SITE_OUT
+//   - session_type = 'duty'  → missed DUTY_END (from a PREVIOUS day only)
+//
+// Excludes today's active duty session (that's the current working session).
+// Each row includes site_name, job_code for display.
+// ─────────────────────────────────────────────────────────────────────────────
+router.get('/open-sessions/:empId', async (req, res) => {
+  const { empId } = req.params;
+  try {
+    const result = await pool.query(`
+      SELECT
+        s.id,
+        s.employee_id,
+        s.session_type,
+        s.punched_in_at,
+        s.site_id,
+        s.job_id,
+        si.site_name,
+        j.job_code,
+        j.job_number
+      FROM active_sessions s
+      LEFT JOIN sites si ON s.site_id = si.id
+      LEFT JOIN jobs  j  ON s.job_id  = j.id
+      WHERE s.employee_id = $1
+        AND (
+          -- All open site sessions (missed SITE_OUT)
+          s.session_type = 'site'
+          OR
+          -- Duty sessions from a PREVIOUS day only (not today's active duty)
+          (s.session_type = 'duty' AND s.punched_in_at::date < CURRENT_DATE)
+        )
+      ORDER BY s.punched_in_at DESC
+    `, [empId]);
+
+    res.json(result.rows);
+  } catch (err) {
+    logger.error(`open-sessions failed for ${empId}: ${err.message}`, {
+      category: 'attendance', user_id: empId,
+    });
     res.status(500).json({ error: err.message });
   }
 });

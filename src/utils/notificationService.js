@@ -263,3 +263,160 @@ A score reduction has been applied to the employee's record.
     logger.error(`notifyPM failed: ${err.message}`, { category: 'notification' });
   }
 }
+
+
+// =============================================================================
+// EXPORTED: getApproverChain
+// Resolves the full approver chain for an employee based on their role.
+//
+// Rules:
+//   Technician  → [Supervisor, Team Lead, Admin]
+//   Supervisor  → [Team Lead, Admin]
+//   Team Lead   → [Admin]
+//   Admin/other → [Admin]  (fallback)
+//
+// Walks the reports_to chain upward from the submitter.
+// Returns array of { emp_id, name, email, phone, role_name } — all approvers
+// who should see and be notified of this request.
+// =============================================================================
+export async function getApproverChain(empId) {
+  try {
+    // Fetch submitter's role
+    const submitterRes = await pool.query(`
+      SELECT e.emp_id, r.name AS role_name
+      FROM employees e
+      LEFT JOIN roles r ON e.role_id = r.id
+      WHERE e.emp_id = $1
+    `, [empId]);
+
+    const submitterRole = submitterRes.rows[0]?.role_name || '';
+
+    // Determine how many levels up we need to go
+    // Technician → 3 levels, Supervisor → 2 levels, Team Lead → 1 level
+    const levelMap = {
+      'Technician': 3,
+      'Supervisor':  2,
+      'Team Lead':   1,
+    };
+    const maxLevels = levelMap[submitterRole] ?? 1;
+
+    const approvers = [];
+    const seen = new Set();
+    let currentId = empId;
+
+    for (let i = 0; i < maxLevels; i++) {
+      const res = await pool.query(`
+        SELECT e.emp_id, e.name, e.email, e.phone, r.name AS role_name
+        FROM employees e
+        LEFT JOIN roles r ON e.role_id = r.id
+        WHERE e.emp_id = (
+          SELECT reports_to FROM employees WHERE emp_id = $1
+        )
+      `, [currentId]);
+
+      const approver = res.rows[0];
+      if (!approver || seen.has(approver.emp_id)) break;
+
+      seen.add(approver.emp_id);
+      approvers.push(approver);
+      currentId = approver.emp_id;
+
+      // If we've reached Admin, stop — Admin is always the top
+      if (approver.role_name === 'Admin') break;
+    }
+
+    // Always ensure Admin is included if not already in chain
+    if (!approvers.some(a => a.role_name === 'Admin')) {
+      const adminRes = await pool.query(`
+        SELECT e.emp_id, e.name, e.email, e.phone, r.name AS role_name
+        FROM employees e
+        JOIN roles r ON e.role_id = r.id
+        WHERE LOWER(r.name) = 'admin'
+        ORDER BY e.created_at ASC
+        LIMIT 1
+      `);
+      const admin = adminRes.rows[0];
+      if (admin && !seen.has(admin.emp_id)) {
+        approvers.push(admin);
+      }
+    }
+
+    return approvers; // ordered: closest approver first → Admin last
+  } catch (err) {
+    logger.error(`getApproverChain failed for ${empId}: ${err.message}`, {
+      category: 'notification',
+    });
+    return [];
+  }
+}
+
+// =============================================================================
+// EXPORTED: insertApprovalReviewers
+// Inserts rows into approval_reviewers table for each approver in the chain.
+// Called right after INSERT INTO approval_requests.
+// client: pg PoolClient (already in transaction)
+// =============================================================================
+export async function insertApprovalReviewers(client, approvalRequestId, approvers) {
+  for (const approver of approvers) {
+    await client.query(`
+      INSERT INTO approval_reviewers (approval_request_id, reviewer_emp_id, role_name)
+      VALUES ($1, $2, $3)
+      ON CONFLICT (approval_request_id, reviewer_emp_id) DO NOTHING
+    `, [approvalRequestId, approver.emp_id, approver.role_name || null]);
+  }
+}
+
+// =============================================================================
+// EXPORTED: notifyApprovers
+// Replaces all notifyTL + notifyTLSocket calls.
+// Resolves the full approver chain for empId, then:
+//   - Emits socket event to each approver's emp room
+//   - Sends email + WhatsApp to each approver
+//
+// io: socket.io Server instance (passed in to avoid circular imports)
+// event: socket event name e.g. 'new-approval-task'
+// socketPayload: object emitted via socket
+// type: email template type ('correction' | 'special_punch' | 'long_duty')
+// emailPayload: { emp_id, reason, sub_type?, proposed_out_time?, punch_time? }
+// =============================================================================
+export async function notifyApprovers(io, empId, event, socketPayload, type, emailPayload) {
+  try {
+    const approvers = await getApproverChain(empId);
+    if (!approvers.length) {
+      logger.warn(`notifyApprovers: no approvers found for ${empId}`, {
+        category: 'notification',
+      });
+      return approvers;
+    }
+
+    const emp = await getEmployee(empId);
+
+    for (const approver of approvers) {
+      // Socket notify
+      io.to(`emp-${approver.emp_id}`).emit(event, {
+        ...socketPayload,
+        routed_to: approver.emp_id,
+        routed_to_role: approver.role_name,
+      });
+
+      // Email notify (fire-and-forget per approver)
+      notifyTL(approver.emp_id, type, emailPayload).catch(e =>
+        logger.warn(`notifyApprovers email failed for ${approver.emp_id}: ${e.message}`, {
+          category: 'notification',
+        })
+      );
+    }
+
+    logger.info(
+      `Approvers notified for ${empId} [${type}]: ${approvers.map(a => a.emp_id).join(', ')}`,
+      { category: 'notification', user_id: empId }
+    );
+
+    return approvers;
+  } catch (err) {
+    logger.error(`notifyApprovers failed for ${empId}: ${err.message}`, {
+      category: 'notification',
+    });
+    return [];
+  }
+}

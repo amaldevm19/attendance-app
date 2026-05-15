@@ -76,6 +76,7 @@ app.use(cors({
 app.use(express.json({ limit: '50mb' }));
 app.use(express.urlencoded({ limit: '50mb', extended: true }));
 app.use('/uploads', express.static('uploads'));
+app.use('/models', express.static('models')); // Serve face-api model files to mobile devices
 app.use(httpLogger); // Auto-log all HTTP requests
 
 
