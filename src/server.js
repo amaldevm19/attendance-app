@@ -33,6 +33,8 @@ import assessmentRoutes  from './routes/assessmentRoutes.js';
 import qaRoutes          from './routes/qaRoutes.js';
 import { startAssessmentCron } from './utils/assessmentCron.js';
 import systemSettingsRoutes from './routes/systemSettingsRoutes.js';
+import aiRoutes from './routes/aiRoutes.js';
+import productRoutes from './routes/productRoutes.js';
 
 dotenv.config();
 
@@ -99,6 +101,8 @@ app.use('/api/seed',      seedRoutes);
 app.use('/api/assessment', assessmentRoutes);
 app.use('/api/qa',         qaRoutes);
 app.use('/api/system/settings', systemSettingsRoutes);
+app.use('/api/ai', aiRoutes);
+app.use('/api/products', productRoutes);
 
 // ── Global error handler (must be LAST) ──────────────────────────────────────
 app.use(errorHandler);

@@ -317,6 +317,25 @@ WHERE p.name IN (
 )
 ON CONFLICT DO NOTHING;
 
+INSERT INTO ai_providers (provider_key, display_name, api_key_encrypted, base_url, is_enabled)
+VALUES ('openrouter', 'OpenRouter', NULL, 'https://openrouter.ai/api/v1', FALSE)
+ON CONFLICT (provider_key) DO NOTHING;
+
+
+-- DEFAULT FALSE is safer — forces explicit opt-in per session
+-- Anthropic/OpenAI/Google always pass true from the frontend
+-- OpenRouter passes the value from the model picker
+ALTER TABLE ai_chat_sessions 
+  ADD COLUMN IF NOT EXISTS supports_tools BOOLEAN NOT NULL DEFAULT FALSE;
+
+-- Fix existing sessions — assume tools for non-OpenRouter providers
+-- (they were created before this column existed)
+UPDATE ai_chat_sessions s
+SET supports_tools = TRUE
+FROM ai_providers p
+WHERE s.provider_id = p.id
+AND p.provider_key IN ('anthropic', 'openai', 'google');
+
 -- =============================================================================
 -- SECTION 12: Comments
 -- =============================================================================
